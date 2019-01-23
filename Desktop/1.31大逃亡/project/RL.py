@@ -1,87 +1,129 @@
-import pandas as pd
-import grnenv
-from RL_brain import PolicyGradient
-import matplotlib.pyplot as plt
-import random
+"""
+This part of code is the reinforcement learning brain, which is a brain of the agent.
+All decisions are made in here.
+
+Policy Gradient, Reinforcement Learning.
+
+View more on my tutorial page: https://morvanzhou.github.io/tutorials/
+
+Using:
+Tensorflow: 1.0
+gym: 0.8.0
+"""
+
 import numpy as np
-
-##------- BTR-DATA----------process##
-## cell:  mep-->gmp
-btr_bool_data = pd.read_csv("input_data/btr_bool.csv")
-btr_dist_matrix = pd.read_csv("input_data/blood_distanceMatrix.csv")
-btr_energy_matrix = pd.read_csv("input_data/blood_energyMatrix.csv")
-btr_data = pd.read_csv("input_data/btr_qpcr.csv")
-#btrnames = ['eklf','fli1','fog1','gata1','gata2','gfi1','scl','sfpi1','cebpa','cjun','egrnab']
-#KeyError: "['eklf' 'fog1' 'cebpa' 'cjun' 'egrnab'] not in index"
-btrnames = ['fli1','gata1','gata2','gfi1','scl','sfpi1']
-df = btr_dist_matrix.values
-bt_dis = df[178:634,179:635]
-
-df = btr_bool_data[btrnames]
-dt = df.values
-bt_bool = dt[178:634,:]
-
-df = btr_data[btrnames]
-bt_data = df.values[178:634,:]
-
-bt_energy = btr_energy_matrix.values[0][178:634]
-
-#DISPLAY_REWARD_THRESHOLD = 400  # renders environment if total episode reward is greater then this threshold
-RENDER = False  # rendering wastes time
-
-env = grnenv.GrnEnv(bt_data,bt_bool,bt_dis,bt_energy)
-env.seed(1)     # reproducible, general Policy gradient has high variance
+import tensorflow as tf
+import random
+# reproducible
+#np.random.seed(1)
+tf.set_random_seed(1)
 
 
-def get_final_network(action_set):
-    ## network is a matrix
-    total = sum(action_set)
-    mean = np.mean(total)
-    var = np.var(total)
-    line = mean
-    network = []#np.array([])
-    for x in total:
-        if(x>line):
-            network.append(1)
-        else:
-            network.append(0)
-    network = np.array(network).reshape(env.numGene,env.numGene)
-    return network
+class PolicyGradient:
+    def __init__(
+            self,
+            n_actions,
+            n_features,
+            learning_rate=0.01,
+            reward_decay=0.95,
+            output_graph=False,
+    ):
+        self.n_actions = n_actions
+        self.n_features = n_features
+        self.lr = learning_rate
+        self.gamma = reward_decay
 
-RL = PolicyGradient(
-    n_actions=env.action_space.n,
-    n_features=env.numGene,#observation_space.shape[0],
-    learning_rate=0.02,
-    reward_decay=0.99,
-    # output_graph=True,
-)
-action_set = []#np.array()
-rank = 280
-for i_episode in range(300):
+        self.ep_obs, self.ep_as, self.ep_rs = [], [], []
 
-    observation = env.reset()
-    idx = 0
-    while True:
-        if RENDER: env.render()        
-        action = RL.choose_action(observation)
-        if(i_episode>rank):
-            action_set.append(action)
-        observation_, reward, done, info = env.step(action)
-        if(idx==env.numCell*1):
-            done = True
-        RL.store_transition(observation, action, reward)
+        self._build_net()
 
-        if done:
-            ep_rs_sum = sum(RL.ep_rs)
+        self.sess = tf.Session()
 
-            if 'running_reward' not in globals():
-                running_reward = ep_rs_sum
-            else:
-                running_reward = running_reward * 0.99 + ep_rs_sum * 0.01
-            #if running_reward > DISPLAY_REWARD_THRESHOLD: RENDER = True     # rendering
-            print("episode:", i_episode, "  reward:", int(running_reward))
-            break
-        idx+=1
-        observation = observation_
-network = get_final_network(action_set)
-print(network)
+        if output_graph:
+            # $ tensorboard --logdir=logs
+            # http://0.0.0.0:6006/
+            # tf.train.SummaryWriter soon be deprecated, use following
+            tf.summary.FileWriter("logs/", self.sess.graph)
+
+        self.sess.run(tf.global_variables_initializer())
+
+    def _build_net(self):
+        with tf.name_scope('inputs'):
+            self.tf_obs = tf.placeholder(tf.float32, [None, self.n_features], name="observations")
+            self.tf_acts = tf.placeholder(tf.int32, [None, ], name="actions_num")
+            self.tf_vt = tf.placeholder(tf.float32, [None, ], name="actions_value")
+        # fc1
+        layer = tf.layers.dense(
+            inputs=self.tf_obs,
+            units=10,
+            activation=tf.nn.tanh,  # tanh activation
+            kernel_initializer=tf.random_normal_initializer(mean=0, stddev=0.3),
+            bias_initializer=tf.constant_initializer(0.1),
+            name='fc1'
+        )
+        # fc2
+        all_act = tf.layers.dense(
+            inputs=layer,
+            units=self.n_actions,
+            activation=None,
+            kernel_initializer=tf.random_normal_initializer(mean=0, stddev=0.3),
+            bias_initializer=tf.constant_initializer(0.1),
+            name='fc2'
+        )
+
+        self.all_act_prob = tf.nn.softmax(all_act, name='act_prob')  # use softmax to convert to probability
+
+        with tf.name_scope('loss'):
+            # to maximize total reward (log_p * R) is to minimize -(log_p * R), and the tf only have minimize(loss)
+            neg_log_prob = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=all_act, labels=self.tf_acts)   # this is negative log of chosen action
+            # or in this way:
+            # neg_log_prob = tf.reduce_sum(-tf.log(self.all_act_prob)*tf.one_hot(self.tf_acts, self.n_actions), axis=1)
+            loss = tf.reduce_mean(neg_log_prob * self.tf_vt)  # reward guided loss
+
+        with tf.name_scope('train'):
+            self.train_op = tf.train.AdamOptimizer(self.lr).minimize(loss)
+
+    def choose_action(self, observation):
+        prob_weights = self.sess.run(self.all_act_prob, feed_dict={self.tf_obs: observation[np.newaxis, :]})
+        prob_weights = prob_weights[0]
+        prob_weights = prob_weights*len(observation)
+        for i in range(len(prob_weights)):
+            if(prob_weights[i]>1):
+                prob_weights=1
+        action = np.array([np.random.binomial(1,x,1)[0] for x in prob_weights])
+        return action
+
+    def store_transition(self, s, a, r):
+        self.ep_obs.append(s)
+        self.ep_as.append(a)
+        self.ep_rs.append(r)
+
+    def learn(self):
+        # discount and normalize episode reward
+        discounted_ep_rs_norm = self._discount_and_norm_rewards()
+
+        # train on episode
+        self.sess.run(self.train_op, feed_dict={
+             self.tf_obs: np.vstack(self.ep_obs),  # shape=[None, n_obs]
+             self.tf_acts: np.array(self.ep_as),  # shape=[None, ]
+             self.tf_vt: discounted_ep_rs_norm,  # shape=[None, ]
+        })
+
+        self.ep_obs, self.ep_as, self.ep_rs = [], [], []    # empty episode data
+        return discounted_ep_rs_norm
+
+    def _discount_and_norm_rewards(self):
+        # discount episode rewards
+        discounted_ep_rs = np.zeros_like(self.ep_rs)
+        running_add = 0
+        for t in reversed(range(0, len(self.ep_rs))):
+            running_add = running_add * self.gamma + self.ep_rs[t]
+            discounted_ep_rs[t] = running_add
+
+        # normalize episode rewards
+        discounted_ep_rs -= np.mean(discounted_ep_rs)
+        discounted_ep_rs /= np.std(discounted_ep_rs)
+        return discounted_ep_rs
+
+
+
